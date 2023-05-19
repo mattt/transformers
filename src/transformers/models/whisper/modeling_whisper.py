@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-""" PyTorch Whisper model."""
+"""PyTorch Whisper model."""
 
 import math
 from typing import Optional, Tuple, Union
@@ -1326,9 +1326,13 @@ class WhisperDecoder(WhisperPreTrainedModel):
 
         # embed positions
         if input_ids is not None:
-            positions = self.embed_positions(input_ids, past_key_values_length=past_key_values_length, position_ids=position_ids)
+            positions = self.embed_positions(
+                input_ids, past_key_values_length=past_key_values_length, position_ids=position_ids
+            )
         else:
-            positions = self.embed_positions(inputs_embeds, past_key_values_length=past_key_values_length, position_ids=position_ids)
+            positions = self.embed_positions(
+                inputs_embeds, past_key_values_length=past_key_values_length, position_ids=position_ids
+            )
 
         hidden_states = inputs_embeds + positions
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
@@ -1741,8 +1745,8 @@ class WhisperForConditionalGeneration(WhisperPreTrainedModel):
         task=None,
         language=None,
         is_multilingual=None,
-        prompt_ids: Optional[torch.Tensor] = None,
         return_token_timestamps=None,
+        prompt_ids: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         """
@@ -1800,6 +1804,11 @@ class WhisperForConditionalGeneration(WhisperPreTrainedModel):
                 find all the possible language tokens in the `model.generation_config.lang_to_id` dictionary.
             is_multilingual (`bool`, *optional*):
                 Whether or not the model is multilingual.
+            prompt_ids (`torch.Tensor`, *optional*):
+                Rank-1 tensor of token IDs created by passing text to [`~WhisperProcessor.get_prompt_ids`] that is
+                provided as a prompt to each chunk. This can be used to provide or "prompt-engineer" a context for
+                transcription, e.g. custom vocabularies or proper nouns to make it more likely to predict those words
+                correctly. It cannot be used in conjunction with `decoder_start_token_id` as it overwrites this value.
             prompt_ids (`torch.Tensor`, *optional*):
                 Rank-1 tensor of token IDs created by passing text to [`~WhisperProcessor.get_prompt_ids`] that is
                 provided as a prompt to each chunk. This can be used to provide or "prompt-engineer" a context for
@@ -1882,6 +1891,21 @@ class WhisperForConditionalGeneration(WhisperPreTrainedModel):
 
         if task is not None or language is not None or (forced_decoder_ids is None and prompt_ids is not None):
             forced_decoder_ids = []
+        forced_decoder_ids = None
+
+        # Legacy code for backward compatibility
+        if hasattr(self.config, "forced_decoder_ids") and self.config.forced_decoder_ids is not None:
+            forced_decoder_ids = self.config.forced_decoder_ids
+        elif (
+            hasattr(self.generation_config, "forced_decoder_ids")
+            and self.generation_config.forced_decoder_ids is not None
+        ):
+            forced_decoder_ids = self.generation_config.forced_decoder_ids
+        else:
+            forced_decoder_ids = kwargs.get("forced_decoder_ids", None)
+
+        if task is not None or language is not None or (forced_decoder_ids is None and prompt_ids is not None):
+            forced_decoder_ids = []
             if hasattr(generation_config, "language"):
                 if generation_config.language in generation_config.lang_to_id.keys():
                     language_token = generation_config.language
@@ -1922,31 +1946,23 @@ class WhisperForConditionalGeneration(WhisperPreTrainedModel):
                 )
             prompt_ids = prompt_ids.tolist()
             decoder_start_token_id, *text_prompt_ids = prompt_ids
-            # Slicing the text prompt ids in a manner consistent with the OpenAI implementation
-            # to accomodate context space for the prefix (see https://github.com/openai/whisper/blob/c09a7ae299c4c34c5839a76380ae407e7d785914/whisper/decoding.py#L599)
-            text_prompt_ids = text_prompt_ids[-self.config.max_target_positions // 2 - 1 :]
             # Set the decoder_start_token_id to <|startofprev|>
             kwargs.update({"decoder_start_token_id": decoder_start_token_id})
 
-            # If the user passes `max_new_tokens`, increase its number to account for the prompt
-            if kwargs.get("max_new_tokens", None) is not None:
-                kwargs["max_new_tokens"] += len(text_prompt_ids)
-                if kwargs["max_new_tokens"] >= self.config.max_target_positions:
-                    raise ValueError(
-                        f"The length of the sliced `prompt_ids` is {len(text_prompt_ids)}, and the `max_new_tokens` "
-                        f"{kwargs['max_new_tokens'] - len(text_prompt_ids)}. Thus, the combined length of the sliced "
-                        f"`prompt_ids` and `max_new_tokens` is: {kwargs['max_new_tokens']}. This exceeds the "
-                        f"`max_target_positions` of the Whisper model: {self.config.max_target_positions}. "
-                        "You should either reduce the length of your prompt, or reduce the value of `max_new_tokens`, "
-                        f"so that their combined length is less that {self.config.max_target_positions}."
-                    )
+            # Update the max generation length to include the prompt
+            specified_max_length = kwargs.pop("max_new_tokens", None) or kwargs.pop("max_length", None)
+            default_max_length = generation_config.max_new_tokens or generation_config.max_length
+            non_prompt_max_length = specified_max_length or default_max_length
+            kwargs["max_new_tokens"] = non_prompt_max_length + len(text_prompt_ids)
 
             # Reformat the forced_decoder_ids to incorporate the prompt
             non_prompt_forced_decoder_ids = (
                 kwargs.pop("forced_decoder_ids", None) or generation_config.forced_decoder_ids
             )
             forced_decoder_ids = [
-                *text_prompt_ids,
+                # Slicing the text prompt ids in a manner consistent with the OpenAI implementation
+                # to accomodate context space for the prefix (see https://github.com/openai/whisper/blob/c09a7ae299c4c34c5839a76380ae407e7d785914/whisper/decoding.py#L599)
+                *text_prompt_ids[-self.config.max_length // 2 - 1 :],
                 generation_config.decoder_start_token_id,
                 *[token for _rank, token in non_prompt_forced_decoder_ids],
             ]
@@ -1956,22 +1972,7 @@ class WhisperForConditionalGeneration(WhisperPreTrainedModel):
         if generation_config.return_timestamps:
             logits_processor = [WhisperTimeStampLogitsProcessor(generation_config)]
 
-        if return_token_timestamps:
-            kwargs["output_attentions"] = True
-            kwargs["return_dict_in_generate"] = True
-
-            if getattr(generation_config, "task", None) == "translate":
-                logger.warning("Token-level timestamps may not be reliable for task 'translate'.")
-            if not hasattr(generation_config, "alignment_heads"):
-                raise ValueError(
-                    "Model generation config has no `alignment_heads`, token-level timestamps not available. "
-                    "See https://gist.github.com/hollance/42e32852f24243b748ae6bc1f985b13a on how to add this property to the generation config."
-                )
-
-            if kwargs.get("num_frames") is not None:
-                generation_config.num_frames = kwargs.pop("num_frames")
-
-        outputs = super().generate(
+        return super().generate(
             inputs,
             generation_config,
             logits_processor,
@@ -1981,13 +1982,13 @@ class WhisperForConditionalGeneration(WhisperPreTrainedModel):
             **kwargs,
         )
 
-        if return_token_timestamps and hasattr(generation_config, "alignment_heads"):
-            num_frames = getattr(generation_config, "num_frames", None)
-            outputs["token_timestamps"] = self._extract_token_timestamps(
-                outputs, generation_config.alignment_heads, num_frames=num_frames
-            )
+        # if return_token_timestamps and hasattr(generation_config, "alignment_heads"):
+        #     num_frames = getattr(generation_config, "num_frames", None)
+        #     outputs["token_timestamps"] = self._extract_token_timestamps(
+        #         outputs, generation_config.alignment_heads, num_frames=num_frames
+        #     )
 
-        return outputs
+        # return outputs
 
     def prepare_inputs_for_generation(
         self,

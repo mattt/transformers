@@ -400,6 +400,11 @@ class WhisperTokenizerFast(PreTrainedTokenizerFast):
     def _decode(
         self, *args, normalize: bool = False, basic_normalize: bool = False, remove_diacritics: bool = False, **kwargs
     ) -> str:
+        if kwargs["skip_special_tokens"]:
+            prompt_token_id = self.convert_tokens_to_ids("<|startofprev|>")
+            decoder_start_token_id = self.convert_tokens_to_ids("<|startoftranscript|>")
+            kwargs["token_ids"] = self._strip_prompt(kwargs["token_ids"], prompt_token_id, decoder_start_token_id)
+
         text = super()._decode(*args, **kwargs)
 
         if normalize:
@@ -594,7 +599,7 @@ class WhisperTokenizerFast(PreTrainedTokenizerFast):
     # Copied from transformers.models.whisper.tokenization_whisper.WhisperTokenizer.get_prompt_ids
     def get_prompt_ids(self, text: str, return_tensors="np"):
         """Converts prompt text to IDs that can be passed to [`~WhisperForConditionalGeneration.generate`]."""
-        batch_encoding = self("<|startofprev|>", " " + text.strip(), add_special_tokens=False)
+        batch_encoding = self("<|startofprev|>", text.strip(), add_prefix_space=True, add_special_tokens=False)
 
         # Check for special tokens
         prompt_text_ids = batch_encoding["input_ids"][1:]
